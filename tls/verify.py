@@ -1,8 +1,8 @@
-"""TLS certificate verification: executable specification (stubs only).
+"""TLS certificate verification: executable specification.
 
 The exercise models a deliberately small, text-based certificate format so the
-whole verifier can be written with the standard library only.  A certificate is
-a sequence of ``name=value`` lines::
+whole verifier can be written with the standard library only.  A certificate
+is a sequence of ``name=value`` lines::
 
     subject=app.example.com
     issuer=Example Intermediate
@@ -30,7 +30,7 @@ IDNA, trailing-dot, whitespace or wildcard-crossing matching.
 
 import hashlib
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 
 __all__ = [
     "hostname_match",
@@ -46,6 +46,40 @@ __all__ = [
 # A leaf plus at most three intermediates/roots.  Longer chains are rejected.
 MAX_CHAIN_LENGTH = 4
 SHA256_HEX_LEN = 64
+
+_HEX_RE = re.compile(r"^[0-9a-f]+$")
+_ISO_RE = re.compile(
+    r"^(\d{4})-(\d{1,2})-(\d{1,2})"
+    r"(?:[T ](\d{1,2}):(\d{2})(?::(\d{2}))?)?$"
+)
+
+
+def _parse_time(value):
+    """Parse a naive UTC ``datetime`` from a datetime or an ISO-like string.
+
+    Accepted string forms: ``YYYY-M-D``, ``YYYY-M-DTHH:MM`` and
+    ``YYYY-M-DTHH:MM:SS`` with an optional space instead of ``T``.  Aware
+    datetimes are converted to UTC and made naive.  Raises ``ValueError`` for
+    anything unparsable and ``TypeError`` for a value of an unusable type.
+    """
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
+    if not isinstance(value, str):
+        raise TypeError("datetime or ISO-8601 string required")
+    match = _ISO_RE.match(value)
+    if match is None:
+        raise ValueError("unparsable date/time: %r" % (value,))
+    year, month, day, hour, minute, second = match.groups()
+    return datetime(
+        int(year),
+        int(month),
+        int(day),
+        int(hour) if hour is not None else 0,
+        int(minute) if minute is not None else 0,
+        int(second) if second is not None else 0,
+    )
 
 
 def hostname_match(pattern: str, host: str) -> bool:
@@ -69,7 +103,43 @@ def hostname_match(pattern: str, host: str) -> bool:
 
     Tolerance is 0: the match is on label boundaries, not string suffixes.
     """
-    raise NotImplementedError
+    if not isinstance(pattern, str) or not isinstance(host, str):
+        return False
+    if not pattern or not host:
+        return False
+
+    pattern_labels = pattern.split(".")
+    host_labels = host.split(".")
+
+    # A wildcard is valid only as the complete left-most label; a "*" inside
+    # any other label (or a bare empty label) invalidates the whole pattern.
+    for label in pattern_labels[1:]:
+        if "*" in label or not label:
+            return False
+    if pattern_labels[0] != "*" and ("*" in pattern_labels[0]
+                                     or not pattern_labels[0]):
+        return False
+    if any(label == "" for label in host_labels):
+        return False
+
+    if pattern_labels[0] == "*":
+        # The wildcard consumes exactly one label: the host must have exactly
+        # one label more than the non-wildcard suffix, never zero or two.
+        if len(host_labels) != len(pattern_labels):
+            return False
+        return all(
+            host_labels[i].lower() == pattern_labels[i].lower()
+            for i in range(1, len(pattern_labels))
+        )
+
+    # No wildcard: every label must be equal; endswith-style suffix matching
+    # would let evil-example.com or sub.example.com impersonate example.com.
+    if len(host_labels) != len(pattern_labels):
+        return False
+    return all(
+        host_labels[i].lower() == pattern_labels[i].lower()
+        for i in range(len(pattern_labels))
+    )
 
 
 def validity_ok(not_before, not_after, now) -> bool:
@@ -88,7 +158,20 @@ def validity_ok(not_before, not_after, now) -> bool:
     string ``2026-9-30`` sorts later.  Tolerance is 0: a value one second
     outside the window is rejected.
     """
-    raise NotImplementedError
+    try:
+        start = _parse_time(not_before)
+        end = _parse_time(not_after)
+        moment = _parse_time(now)
+    except (ValueError, TypeError):
+        return False
+
+    # A reversed window can never contain anything.
+    if start > end:
+        return False
+
+    # Both bounds are checked; checking only not_before would admit an expired
+    # certificate.  Comparison is on datetimes, never on the raw strings.
+    return start <= moment <= end
 
 
 def parse_cert(text: str) -> dict:
@@ -138,7 +221,101 @@ def parse_cert(text: str) -> dict:
     Tolerance is 0: no IDNA, trailing-dot, case or whitespace normalization is
     performed beyond the rules above.
     """
-    raise NotImplementedError
+    if not isinstance(text, str):
+        raise ValueError("certificate text must be a string")
+
+    values = {}
+    extensions = {}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if "=" not in line:
+            raise ValueError("malformed line (no '='): %r" % line)
+        name, value = line.split("=", 1)
+        name = name.strip()
+        if not name:
+            raise ValueError("malformed line (empty name): %r" % line)
+        lname = name.lower()
+
+        if lname.startswith("ext."):
+            ext_name = lname[len("ext."):]
+            if not ext_name or ext_name in extensions:
+                raise ValueError("bad or duplicate extension: %r" % name)
+            extensions[ext_name] = value.strip()
+        else:
+            if lname in values:
+                raise ValueError("duplicate name: %r" % name)
+            values[lname] = value
+
+    required = ("subject", "issuer", "serial", "not_before",
+                "not_after", "key", "signer")
+    for name in required:
+        if name not in values:
+            raise ValueError("missing required field: %s" % name)
+    for name in values:
+        if name not in required:
+            raise ValueError("unknown top-level name: %s" % name)
+
+    def normalize_cn(raw):
+        cn = raw.strip()
+        if cn[:3].lower() == "cn=":
+            cn = cn[3:].strip()
+        if not cn:
+            raise ValueError("empty common name")
+        return cn.lower()
+
+    subject = normalize_cn(values["subject"])
+    issuer = normalize_cn(values["issuer"])
+
+    serial = values["serial"].strip().lower()
+    if not (1 <= len(serial) <= 64) or _HEX_RE.match(serial) is None:
+        raise ValueError("serial must be 1..64 lower-case hex characters")
+
+    try:
+        not_before = _parse_time(values["not_before"].strip())
+        not_after = _parse_time(values["not_after"].strip())
+    except (ValueError, TypeError) as exc:
+        raise ValueError("invalid validity date: %s" % exc)
+    if not_before > not_after:
+        raise ValueError("not_before is after not_after")
+
+    key = values["key"].strip()
+    if not key:
+        raise ValueError("empty key")
+
+    signer = values["signer"].strip().lower()
+    if signer == "self":
+        if subject != issuer:
+            raise ValueError("self-signed cert requires subject == issuer")
+    else:
+        if len(signer) != SHA256_HEX_LEN or _HEX_RE.match(signer) is None:
+            raise ValueError("signer must be 'self' or 64 hex characters")
+
+    san = []
+    san_value = extensions.pop("subjectaltname", None)
+    if san_value is not None:
+        for entry in san_value.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            if entry[:3].upper() == "IP:":
+                continue
+            if entry[:4].upper() == "DNS:":
+                entry = entry[4:].strip()
+            if entry:
+                san.append(entry.lower())
+
+    return {
+        "subject": subject,
+        "issuer": issuer,
+        "serial": serial,
+        "not_before": not_before,
+        "not_after": not_after,
+        "san": san,
+        "extensions": extensions,
+        "key": key,
+        "signer": signer,
+    }
 
 
 def chain_ok(chain, roots) -> bool:
@@ -166,7 +343,37 @@ def chain_ok(chain, roots) -> bool:
     Do not mutate the inputs.  Return False for malformed values instead of
     raising.
     """
-    raise NotImplementedError
+    try:
+        if not isinstance(chain, list) or not isinstance(roots, list):
+            return False
+        if not (1 <= len(chain) <= MAX_CHAIN_LENGTH):
+            return False
+
+        # Every adjacent pair must be linked both by name and by the
+        # fingerprint relation.  A trusted root appearing anywhere other than
+        # the last position does not help: the chain is walked in order and no
+        # link may be skipped, reordered or signed by an unrelated certificate.
+        for i in range(len(chain) - 1):
+            child = chain[i]
+            parent = chain[i + 1]
+            if not isinstance(child, dict) or not isinstance(parent, dict):
+                return False
+            if child["issuer"].lower() != parent["subject"].lower():
+                return False
+            if child["signer"] != fingerprint(parent):
+                return False
+
+        # Only the final certificate may terminate the chain, and it must be
+        # byte-for-byte the same certificate as an entry in the trust store.
+        # A self-signed certificate carries no authority on its own.
+        terminal = chain[-1]
+        terminal_fp = fingerprint(terminal)
+        return any(
+            isinstance(root, dict) and fingerprint(root) == terminal_fp
+            for root in roots
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def fingerprint(cert) -> str:
@@ -192,7 +399,40 @@ def fingerprint(cert) -> str:
     Return the same value for repeated calls with equal input.  Raise
     ``ValueError`` for a value that is not a parsed certificate.
     """
-    raise NotImplementedError
+    required_keys = {
+        "subject",
+        "issuer",
+        "serial",
+        "not_before",
+        "not_after",
+        "san",
+        "extensions",
+        "key",
+        "signer",
+    }
+    if not isinstance(cert, dict) or set(cert) != required_keys:
+        raise ValueError("not a parsed certificate")
+    if not isinstance(cert["san"], list) or not isinstance(
+        cert["extensions"], dict
+    ):
+        raise ValueError("not a parsed certificate")
+
+    lines = [
+        "subject=" + cert["subject"],
+        "issuer=" + cert["issuer"],
+        "serial=" + cert["serial"],
+        "not_before=" + cert["not_before"].isoformat(),
+        "not_after=" + cert["not_after"].isoformat(),
+        "san=" + ",".join(cert["san"]),
+        "key=" + cert["key"],
+        "signer=" + cert["signer"],
+    ]
+    # Extension order must not affect the digest.
+    for name in sorted(cert["extensions"]):
+        lines.append("ext." + name + "=" + cert["extensions"][name])
+
+    canonical = "".join(line + "\n" for line in lines)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def pin_ok(cert, pins) -> bool:
@@ -213,7 +453,42 @@ def pin_ok(cert, pins) -> bool:
     prefix such as the first 16 hex characters must not match.  Malformed or
     unparsable pins are skipped, never raised.  Pinning is exact (tolerance 0).
     """
-    raise NotImplementedError
+    if pins is None:
+        return True
+    try:
+        if len(pins) == 0:
+            return True
+        target = fingerprint(cert)
+        iter(pins)
+    except (ValueError, TypeError):
+        return False
+
+    for pin in pins:
+        if not isinstance(pin, str) or not pin:
+            continue
+
+        candidate = pin
+        if pin.startswith("sha256:"):
+            candidate = pin[len("sha256:"):]
+
+        if len(candidate) == SHA256_HEX_LEN and _HEX_RE.match(
+            candidate
+        ) is not None:
+            # Exact equality only: startswith-style prefix matching would let a
+            # short or partial pin authenticate an unrelated certificate.
+            if candidate == target:
+                return True
+            continue
+
+        # Any other pin form is treated as the text of a pinned certificate.
+        try:
+            pinned = parse_cert(pin)
+        except ValueError:
+            continue
+        if fingerprint(pinned) == target:
+            return True
+
+    return False
 
 
 def validate_policy(policy) -> list[str]:
@@ -250,7 +525,54 @@ def validate_policy(policy) -> list[str]:
     Never raise for malformed input; return codes.  Problem strings are stable
     English identifiers so tests and operators can match them exactly.
     """
-    raise NotImplementedError
+    problems = []
+    if not isinstance(policy, dict):
+        policy = {}
+
+    roots = policy.get("roots")
+    if "roots" not in policy or roots is None:
+        problems.append("roots:missing")
+    elif not isinstance(roots, list):
+        problems.append("roots:not-list")
+    elif len(roots) == 0:
+        problems.append("roots:empty")
+
+    if "now" not in policy or policy.get("now") is None:
+        problems.append("now:missing")
+    else:
+        try:
+            _parse_time(policy["now"])
+        except (ValueError, TypeError):
+            problems.append("now:invalid")
+
+    if policy.get("allow_unknown_roots", False) is True:
+        problems.append("unknown-roots-allowed")
+
+    if "check_hostname" in policy and not isinstance(
+        policy["check_hostname"], bool
+    ):
+        problems.append("check-hostname:invalid")
+    elif policy.get("check_hostname", True) is False:
+        problems.append("hostname-not-checked")
+
+    validity_days = policy.get("max_validity_days", 365)
+    if isinstance(validity_days, bool) or not isinstance(validity_days, int):
+        problems.append("validity-window:invalid")
+    elif validity_days <= 0:
+        problems.append("validity-window-zero")
+
+    chain_length = policy.get("max_chain_length", MAX_CHAIN_LENGTH)
+    if (
+        isinstance(chain_length, bool)
+        or not isinstance(chain_length, int)
+        or not (1 <= chain_length <= MAX_CHAIN_LENGTH)
+    ):
+        problems.append("max-chain-length:invalid")
+
+    if "pins" in policy and not isinstance(policy["pins"], list):
+        problems.append("pins:not-list")
+
+    return problems
 
 
 def verify_batch(peers, policy) -> dict:
@@ -311,4 +633,136 @@ def verify_batch(peers, policy) -> dict:
     single-peer call and the same peer inside a larger batch compare equal.
     All checks are deterministic and offline.
     """
-    raise NotImplementedError
+    problems = validate_policy(policy)
+    if problems:
+        # Invalid policy is fail-closed: no peer is ever evaluated.
+        return {"ok": False, "results": [], "failed": [], "errors": problems}
+
+    now = policy["now"]
+    max_chain_length = policy.get("max_chain_length", MAX_CHAIN_LENGTH)
+    pins = policy.get("pins")
+
+    # Trust store entries may arrive as text or as parsed certificates.
+    # Unparsable entries simply cannot authenticate anything.
+    trusted_roots = []
+    for root in policy["roots"]:
+        if isinstance(root, dict):
+            trusted_roots.append(root)
+        elif isinstance(root, str):
+            try:
+                trusted_roots.append(parse_cert(root))
+            except ValueError:
+                continue
+
+    results = []
+    failed = []
+    try:
+        peer_iter = enumerate(peers)
+    except TypeError:
+        # A non-iterable peer list cannot describe any connection.
+        return {"ok": False, "results": [], "failed": [], "errors": []}
+
+    for index, peer in peer_iter:
+        if not isinstance(peer, dict):
+            results.append(
+                {
+                    "ok": False,
+                    "hostname_ok": False,
+                    "validity_ok": False,
+                    "chain_ok": False,
+                    "pin_ok": False,
+                    "errors": ["cert:invalid"],
+                }
+            )
+            failed.append(index)
+            continue
+
+        cert_text = peer.get("cert")
+        chain_texts = peer.get("chain")
+        if chain_texts is None:
+            chain_texts = [cert_text]
+        if not isinstance(chain_texts, list):
+            chain_texts = []
+
+        # Every peer parses its own leaf and chain from scratch; nothing from a
+        # previous peer (parsed cert, SAN, hostname or result) is reused.
+        try:
+            leaf = parse_cert(cert_text)
+            chain = [parse_cert(item) for item in chain_texts]
+        except (ValueError, TypeError):
+            results.append(
+                {
+                    "ok": False,
+                    "hostname_ok": False,
+                    "validity_ok": False,
+                    "chain_ok": False,
+                    "pin_ok": False,
+                    "errors": ["cert:invalid"],
+                }
+            )
+            failed.append(index)
+            continue
+
+        # The chain must start with this peer's own leaf; a chain borrowed
+        # from another connection must never be accepted.
+        if not chain or fingerprint(chain[0]) != fingerprint(leaf):
+            results.append(
+                {
+                    "ok": False,
+                    "hostname_ok": False,
+                    "validity_ok": False,
+                    "chain_ok": False,
+                    "pin_ok": False,
+                    "errors": ["cert:invalid"],
+                }
+            )
+            failed.append(index)
+            continue
+
+        # SAN wins when present: a non-matching SAN must not fall back to CN.
+        host = peer.get("host", "")
+        if leaf["san"]:
+            hostname_ok = any(
+                hostname_match(name, host) for name in leaf["san"]
+            )
+        else:
+            hostname_ok = hostname_match(leaf["subject"], host)
+
+        validity = validity_ok(
+            leaf["not_before"], leaf["not_after"], now
+        )
+
+        chain_good = (
+            len(chain) <= max_chain_length
+            and chain_ok(chain, trusted_roots)
+        )
+        pin_good = pin_ok(leaf, pins)
+
+        errors = []
+        if not hostname_ok:
+            errors.append("hostname")
+        if not validity:
+            errors.append("validity")
+        if not chain_good:
+            errors.append("chain")
+        if not pin_good:
+            errors.append("pin")
+
+        result = {
+            "ok": not errors,
+            "hostname_ok": hostname_ok,
+            "validity_ok": validity,
+            "chain_ok": chain_good,
+            "pin_ok": pin_good,
+            "errors": errors,
+        }
+        results.append(result)
+        if result["ok"] is False:
+            failed.append(index)
+
+    return {
+        "ok": not failed,
+        "results": results,
+        "failed": failed,
+        "errors": [],
+    }
